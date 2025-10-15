@@ -3,13 +3,16 @@ import asyncio
 import logging
 from typing import Optional, Callable
 from datetime import datetime
+from pathlib import Path
 
-from telethon import TelegramClient, events
-from telethon.tl.types import Document, MessageMediaDocument
-from telethon.tl.custom import Button
+from pyrogram import Client, filters
+from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.enums import MessageMediaType
+from pyrogram.errors import RPCError
 import aiofiles
 from aiohttp import web
 import secrets
+import TgCrypto
 
 from config import config
 
@@ -20,8 +23,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Telegram client with config
-client = TelegramClient('file_bot', config.API_ID, config.API_HASH)
+# Initialize Pyrogram client with TgCrypto
+app = Client(
+    "file_bot",
+    api_id=config.API_ID,
+    api_hash=config.API_HASH,
+    bot_token=config.BOT_TOKEN,
+    in_memory=True
+)
 
 # In-memory storage for file links (use database in production)
 file_links = {}
@@ -32,37 +41,51 @@ class ProgressTracker:
     def __init__(self, total_size: int, callback: Callable, operation: str = "Downloading"):
         self.total_size = total_size
         self.callback = callback
-        self.downloaded = 0
+        self.processed = 0
         self.start_time = datetime.now()
         self.operation = operation
         
     def create_callback(self):
-        """Create a Telethon-compatible progress callback"""
-        def telethon_callback(received_bytes, total_bytes):
-            """Telethon progress callback - receives (received_bytes, total_bytes)"""
-            percentage = (received_bytes / total_bytes) * 100 if total_bytes > 0 else 0
+        """Create a Pyrogram-compatible progress callback"""
+        def pyrogram_callback(current, total):
+            """Pyrogram progress callback - receives (current, total)"""
+            percentage = (current / total) * 100 if total > 0 else 0
             
             # Calculate speed
             elapsed = (datetime.now() - self.start_time).total_seconds()
-            speed = received_bytes / elapsed if elapsed > 0 else 0
+            speed = current / elapsed if elapsed > 0 else 0
             
             # Call our custom progress callback
-            self.callback(received_bytes, total_bytes, percentage, speed, self.operation)
+            self.callback(current, total, percentage, speed, self.operation)
         
-        return telethon_callback
+        return pyrogram_callback
 
 class FileHandler:
-    """Handle file operations asynchronously"""
+    """Handle file operations asynchronously with Pyrogram"""
     
     @staticmethod
     async def download_file(
-        message, 
+        message: Message,
         progress_callback: Optional[Callable] = None
     ) -> str:
         """Download file with progress tracking"""
         try:
-            file_name = message.file.name or f"file_{message.id}"
-            file_size = message.file.size
+            # Get file information
+            if message.document:
+                file_name = message.document.file_name or f"document_{message.id}.bin"
+                file_size = message.document.file_size
+            elif message.video:
+                file_name = message.video.file_name or f"video_{message.id}.mp4"
+                file_size = message.video.file_size
+            elif message.audio:
+                file_name = message.audio.file_name or f"audio_{message.id}.mp3"
+                file_size = message.audio.file_size
+            elif message.photo:
+                file_name = f"photo_{message.id}.jpg"
+                file_size = message.photo.file_size
+            else:
+                file_name = f"file_{message.id}.bin"
+                file_size = 0
             
             logger.info(f"Downloading {file_name} ({file_size} bytes)")
             
@@ -70,19 +93,19 @@ class FileHandler:
             os.makedirs('downloads', exist_ok=True)
             file_path = f"downloads/{file_name}"
             
-            # FIXED: Create proper Telethon-compatible progress callback
-            if progress_callback:
+            # Create progress callback
+            if progress_callback and file_size > 0:
                 progress_tracker = ProgressTracker(file_size, progress_callback, "Downloading")
-                telethon_callback = progress_tracker.create_callback()
-                
-                # Download file with progress tracking
-                await message.download_media(
-                    file=file_path,
-                    progress_callback=telethon_callback
-                )
+                pyrogram_callback = progress_tracker.create_callback()
             else:
-                # Download without progress tracking
-                await message.download_media(file=file_path)
+                pyrogram_callback = None
+            
+            # Download file with progress tracking
+            await message.download(
+                file_name=file_path,
+                progress=pyrogram_callback,
+                progress_args=(file_size,) if file_size > 0 else None
+            )
             
             logger.info(f"Download completed: {file_path}")
             return file_path
@@ -96,34 +119,30 @@ class FileHandler:
         file_path: str,
         chat_id: int,
         progress_callback: Optional[Callable] = None
-    ) -> MessageMediaDocument:
+    ) -> Message:
         """Upload file with progress tracking"""
         try:
             file_size = os.path.getsize(file_path)
+            file_name = os.path.basename(file_path)
             logger.info(f"Uploading {file_path} ({file_size} bytes)")
             
-            # FIXED: Create proper Telethon-compatible progress callback
+            # Create progress callback
             if progress_callback:
                 progress_tracker = ProgressTracker(file_size, progress_callback, "Uploading")
-                telethon_callback = progress_tracker.create_callback()
-                
-                # Upload file with progress tracking
-                message = await client.send_file(
-                    chat_id,
-                    file_path,
-                    force_document=True,
-                    progress_callback=telethon_callback
-                )
+                pyrogram_callback = progress_tracker.create_callback()
             else:
-                # Upload without progress tracking
-                message = await client.send_file(
-                    chat_id,
-                    file_path,
-                    force_document=True
-                )
+                pyrogram_callback = None
+            
+            # Upload file with progress tracking
+            message = await app.send_document(
+                chat_id=chat_id,
+                document=file_path,
+                progress=pyrogram_callback,
+                progress_args=(file_size,) if file_size > 0 else None
+            )
             
             logger.info(f"Upload completed: {file_path}")
-            return message.media
+            return message
             
         except Exception as e:
             logger.error(f"Upload error: {e}")
@@ -139,10 +158,9 @@ class FileHandler:
         domain = getattr(config, 'DOMAIN', 'localhost:8080')
         return f"https://{domain}/download/{token}"
 
-@client.on(events.NewMessage(pattern='/start'))
-async def start_handler(event):
+@app.on_message(filters.command("start"))
+async def start_handler(client, message: Message):
     """Handle /start command"""
-    user = await event.get_sender()
     welcome_text = f"""
 🤖 **Welcome to High-Speed File Bot!** 🚀
 
@@ -150,19 +168,20 @@ async def start_handler(event):
 • Upload any files (up to 4GB)
 • Download with generated links
 • Real-time progress tracking
-• High-speed async operations
+• High-speed async operations with Pyrogram
+• Secure encryption with TgCrypto
 
 **Commands:**
 • Just send me any file to upload
 • Use `/help` for more information
 
-**User ID:** `{user.id}`
+**User ID:** `{message.from_user.id}`
     """
     
-    await event.reply(welcome_text, parse_mode='markdown')
+    await message.reply_text(welcome_text, parse_mode="markdown")
 
-@client.on(events.NewMessage(pattern='/help'))
-async def help_handler(event):
+@app.on_message(filters.command("help"))
+async def help_handler(client, message: Message):
     """Handle /help command"""
     help_text = """
 📖 **How to use this bot:**
@@ -182,51 +201,62 @@ async def help_handler(event):
 **Note:** Files are stored temporarily and links expire after some time.
     """
     
-    await event.reply(help_text, parse_mode='markdown')
+    await message.reply_text(help_text, parse_mode="markdown")
 
-@client.on(events.NewMessage(func=lambda e: e.file and not e.file.mime_type == 'text/plain'))
-async def file_handler(event):
+@app.on_message(
+    filters.document | filters.video | filters.audio | filters.photo,
+    group=1
+)
+async def file_handler(client, message: Message):
     """Handle incoming files"""
     try:
-        user = await event.get_sender()
+        user = message.from_user
         logger.info(f"File received from user {user.id}")
         
         # Send initial progress message
-        progress_msg = await event.reply("📥 **Downloading file...**\n`0%` - Preparing download")
+        progress_msg = await message.reply_text("📥 **Downloading file...**\n`0%` - Preparing download")
         
-        # FIXED: Progress callback with correct parameters
-        async def update_progress(received, total, percentage, speed, operation):
+        # Progress callback
+        async def update_progress(current, total, percentage, speed, operation):
             speed_mb = speed / (1024 * 1024) if speed > 0 else 0
             if total > 0:
-                received_mb = received / (1024 * 1024)
+                current_mb = current / (1024 * 1024)
                 total_mb = total / (1024 * 1024)
-                progress_text = f"📥 **{operation}...**\n`{percentage:.1f}%` ({received_mb:.1f}/{total_mb:.1f} MB) - {speed_mb:.1f} MB/s"
+                progress_text = f"📥 **{operation}...**\n`{percentage:.1f}%` ({current_mb:.1f}/{total_mb:.1f} MB) - {speed_mb:.1f} MB/s"
             else:
                 progress_text = f"📥 **{operation}...**\n`Preparing...`"
             
             try:
-                await progress_msg.edit(progress_text)
+                await progress_msg.edit_text(progress_text)
             except Exception as e:
                 logger.debug(f"Progress update error: {e}")
         
-        # FIXED: Use event.message directly (not event.get_message())
+        # Download the file
         file_path = await FileHandler.download_file(
-            event.message,  # CORRECT: event.message is the message object
+            message,
             progress_callback=update_progress
         )
         
         # Update message for upload
-        await progress_msg.edit("📤 **Uploading to storage...**\n`0%` - Preparing upload")
+        await progress_msg.edit_text("📤 **Uploading to storage...**\n`0%` - Preparing upload")
         
         # Upload the file
-        uploaded_media = await FileHandler.upload_file(
+        uploaded_message = await FileHandler.upload_file(
             file_path,
-            event.chat_id,
+            message.chat.id,
             progress_callback=update_progress
         )
         
         # Generate download link
-        file_id = uploaded_media.document.id
+        if uploaded_message.document:
+            file_id = uploaded_message.document.file_id
+        elif uploaded_message.video:
+            file_id = uploaded_message.video.file_id
+        elif uploaded_message.audio:
+            file_id = uploaded_message.audio.file_id
+        else:
+            file_id = f"file_{uploaded_message.id}"
+            
         download_link = FileHandler.generate_download_link(file_id)
         
         # Get file info
@@ -234,13 +264,19 @@ async def file_handler(event):
         file_size = os.path.getsize(file_path)
         file_size_mb = file_size / (1024 * 1024)
         
+        # Create inline keyboard with download button
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📥 Download File", url=download_link)],
+            [InlineKeyboardButton("🔄 Share", switch_inline_query="")]
+        ])
+        
         # Create response message
         success_text = f"""
 ✅ **File Uploaded Successfully!**
 
 📁 **File Name:** `{file_name}`
 📊 **File Size:** `{file_size_mb:.2f} MB`
-🔗 **Download Link:** {download_link}
+🔗 **Download Link:** `{download_link}`
 
 ⚠️ **Note:** This link will expire after 24 hours.
         """
@@ -252,22 +288,31 @@ async def file_handler(event):
         except Exception as e:
             logger.warning(f"Could not remove file {file_path}: {e}")
         
-        await progress_msg.edit(success_text, parse_mode='markdown')
+        await progress_msg.edit_text(
+            success_text, 
+            parse_mode="markdown",
+            reply_markup=keyboard
+        )
         
+    except RPCError as e:
+        logger.error(f"Telegram RPC error: {e}")
+        await message.reply_text("❌ **Telegram error. Please try again.**")
     except Exception as e:
         logger.error(f"File handling error: {e}")
-        error_msg = await event.reply("❌ **Error processing file. Please try again.**")
+        error_msg = await message.reply_text("❌ **Error processing file. Please try again.**")
         # Delete error message after 10 seconds
         await asyncio.sleep(10)
         await error_msg.delete()
 
-@client.on(events.NewMessage(pattern='/status'))
-async def status_handler(event):
+@app.on_message(filters.command("status"))
+async def status_handler(client, message: Message):
     """Show bot status"""
     status_text = f"""
 🟢 **Bot Status: Online**
 
 **System Information:**
+• Pyrogram: ✅ Enabled
+• TgCrypto: ✅ Active
 • Async operations: ✅ Enabled
 • Progress tracking: ✅ Active
 • Large file support: ✅ Up to 4GB
@@ -282,12 +327,13 @@ async def status_handler(event):
 • Send any file to upload
 • `/help` - Show help
 • `/status` - Show this status
+• `/cleanup` - Cleanup storage
     """
     
-    await event.reply(status_text, parse_mode='markdown')
+    await message.reply_text(status_text, parse_mode="markdown")
 
-@client.on(events.NewMessage(pattern='/cleanup'))
-async def cleanup_handler(event):
+@app.on_message(filters.command("cleanup"))
+async def cleanup_handler(client, message: Message):
     """Clean up expired file links"""
     try:
         # Simple cleanup - remove some old links if we have too many
@@ -309,35 +355,88 @@ async def cleanup_handler(event):
 • Storage optimized: ✅
         """
         
-        await event.reply(cleanup_text, parse_mode='markdown')
+        await message.reply_text(cleanup_text, parse_mode="markdown")
         
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
-        await event.reply(f"❌ **Cleanup error:** {str(e)}")
+        await message.reply_text(f"❌ **Cleanup error:** {str(e)}")
 
-@client.on(events.NewMessage(pattern='/info'))
-async def info_handler(event):
+@app.on_message(filters.command("info"))
+async def info_handler(client, message: Message):
     """Show file info before processing"""
     try:
-        if event.file:
-            file_name = event.file.name or f"file_{event.id}"
-            file_size = event.file.size
-            file_size_mb = file_size / (1024 * 1024)
+        if (message.document or message.video or message.audio or message.photo):
+            if message.document:
+                file_name = message.document.file_name or f"document_{message.id}.bin"
+                file_size = message.document.file_size
+                file_type = "Document"
+            elif message.video:
+                file_name = message.video.file_name or f"video_{message.id}.mp4"
+                file_size = message.video.file_size
+                file_type = "Video"
+            elif message.audio:
+                file_name = message.audio.file_name or f"audio_{message.id}.mp3"
+                file_size = message.audio.file_size
+                file_type = "Audio"
+            elif message.photo:
+                file_name = f"photo_{message.id}.jpg"
+                file_size = message.photo.file_size
+                file_type = "Photo"
+            
+            file_size_mb = file_size / (1024 * 1024) if file_size else 0
             
             info_text = f"""
 📁 **File Information:**
 
 **Name:** `{file_name}`
 **Size:** `{file_size_mb:.2f} MB`
-**Type:** `{event.file.mime_type or 'Unknown'}`
+**Type:** `{file_type}`
 
 Send the file to start upload process.
             """
-            await event.reply(info_text, parse_mode='markdown')
+            await message.reply_text(info_text, parse_mode="markdown")
         else:
-            await event.reply("❌ Please send a file to get information.")
+            await message.reply_text("❌ Please send a file to get information.")
     except Exception as e:
         logger.error(f"Info handler error: {e}")
+
+@app.on_message(filters.command("stats"))
+async def stats_handler(client, message: Message):
+    """Show bot statistics"""
+    try:
+        # Get some basic stats
+        downloads_dir = Path("downloads")
+        if downloads_dir.exists():
+            total_files = len(list(downloads_dir.glob("*")))
+            total_size = sum(f.stat().st_size for f in downloads_dir.glob("*") if f.is_file())
+            total_size_mb = total_size / (1024 * 1024)
+        else:
+            total_files = 0
+            total_size_mb = 0
+        
+        stats_text = f"""
+📊 **Bot Statistics**
+
+**File Storage:**
+• Active download links: `{len(file_links)}`
+• Local files: `{total_files}`
+• Local storage used: `{total_size_mb:.2f} MB`
+
+**Performance:**
+• Pyrogram: ✅ Optimized
+• TgCrypto: ✅ Encrypted
+• Async: ✅ High-speed
+• Progress: ✅ Real-time
+
+**Limits:**
+• Max file size: `4 GB`
+• Link TTL: `24 hours`
+            """
+        
+        await message.reply_text(stats_text, parse_mode="markdown")
+        
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
 
 # Web server for download links (basic implementation)
 async def handle_download(request):
@@ -357,21 +456,21 @@ async def handle_download(request):
         In production, this would serve the file directly.
         Currently, you need to use the Telegram file reference.
         
-        Bot: @{(await client.get_me()).username}
+        Bot: @{(await app.get_me()).username}
         """,
         headers={'Content-Disposition': f'attachment; filename="file_{file_id}"'}
     )
 
 async def start_web_server():
     """Start web server for download links"""
-    app = web.Application()
-    app.router.add_get('/download/{token}', handle_download)
+    app_web = web.Application()
+    app_web.router.add_get('/download/{token}', handle_download)
     
     # Get web server config with defaults
     host = getattr(config, 'WEB_HOST', 'localhost')
     port = getattr(config, 'WEB_PORT', 8080)
     
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app_web)
     await runner.setup()
     
     site = web.TCPSite(runner, host, port)
@@ -380,7 +479,7 @@ async def start_web_server():
 
 async def main():
     """Main function to start the bot"""
-    logger.info("Starting High-Speed File Bot...")
+    logger.info("Starting High-Speed File Bot with Pyrogram...")
     
     # Validate config
     if not all([config.API_ID, config.API_HASH, config.BOT_TOKEN]):
@@ -391,22 +490,23 @@ async def main():
     if getattr(config, 'ENABLE_WEB_SERVER', True):
         await start_web_server()
     
-    # Start the bot
-    await client.start(bot_token=config.BOT_TOKEN)
+    # Start the Pyrogram client
+    await app.start()
     
     # Get bot info
-    me = await client.get_me()
+    me = await app.get_me()
     logger.info(f"Bot started successfully: @{me.username}")
     
     # Log bot capabilities
     logger.info("Bot features:")
+    logger.info("- Pyrogram with TgCrypto encryption")
     logger.info("- Async file operations")
     logger.info("- Progress tracking")
     logger.info("- 4GB file support")
     logger.info("- Download link generation")
     
     # Keep running
-    await client.run_until_disconnected()
+    await asyncio.Event().wait()
 
 if __name__ == '__main__':
     # Create necessary directories
@@ -420,3 +520,6 @@ if __name__ == '__main__':
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
+    finally:
+        # Stop the client properly
+        asyncio.run(app.stop())
