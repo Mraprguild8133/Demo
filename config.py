@@ -1,38 +1,38 @@
 import os
-from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv()
+from typing import Optional
 
 class Config:
-    """Configuration class optimized for Gemini models."""
+    """Configuration class for the Telegram bot"""
+    
     def __init__(self):
-        self.TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-        self.OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-        self.AI_MODEL = os.getenv("AI_MODEL", "google/gemini-2.0-flash-exp")
-        self.OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
-        self.REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
-        self.MAX_MESSAGE_LENGTH = 4096
+        # Required Telegram configuration
+        self.API_ID = int(os.getenv('API_ID', 0))
+        self.API_HASH = os.getenv('API_HASH', '')
+        self.BOT_TOKEN = os.getenv('BOT_TOKEN', '')
         
-        # Gemini-specific parameters
-        self.GEMINI_CONFIG = {
-            "max_tokens": 4000,
-            "temperature": 0.7,
-            "top_p": 0.9,
-        }
+        # Web server configuration (optional)
+        self.WEB_HOST = os.getenv('WEB_HOST', 'localhost')
+        self.WEB_PORT = int(os.getenv('WEB_PORT', 8080))
+        self.ENABLE_WEB_SERVER = os.getenv('ENABLE_WEB_SERVER', 'true').lower() == 'true'
+        
+        # Domain for download links (optional)
+        self.DOMAIN = os.getenv('DOMAIN', 'localhost:8080')
+        
+        # File handling configuration
+        self.MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', 4 * 1024 * 1024 * 1024))  # 4GB default
+        self.FILE_LINK_TTL = int(os.getenv('FILE_LINK_TTL', 24 * 60 * 60))  # 24 hours default
+        
+        # Logging configuration
+        self.LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
+        self.LOG_FILE = os.getenv('LOG_FILE', 'logs/bot.log')
         
     def validate(self) -> bool:
-        """Validate that all required configs are present."""
-        required_vars = {
-            "TELEGRAM_BOT_TOKEN": self.TELEGRAM_BOT_TOKEN,
-            "OPENROUTER_API_KEY": self.OPENROUTER_API_KEY
-        }
-        
-        missing = [var for var, value in required_vars.items() if not value]
-        if missing:
-            print(f"❌ Missing required environment variables: {', '.join(missing)}")
-            return False
+        """Validate required configuration"""
+        required_vars = ['API_ID', 'API_HASH', 'BOT_TOKEN']
+        for var in required_vars:
+            if not getattr(self, var):
+                return False
         return True
 
-# Create global config instance
+# Global config instance
 config = Config()
