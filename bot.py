@@ -12,7 +12,7 @@ from pyrogram.errors import RPCError
 import aiofiles
 from aiohttp import web
 import secrets
-import TgCrypto
+import tgcrypto
 
 from config import config
 
