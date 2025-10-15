@@ -117,16 +117,6 @@ class FileHandler:
         domain = getattr(config, 'DOMAIN', 'localhost:8080')
         return f"https://{domain}/download/{token}"
 
-async def progress_handler(
-    downloaded: int, 
-    total: int, 
-    percentage: float, 
-    speed: float
-):
-    """Handle progress updates"""
-    speed_mb = speed / (1024 * 1024)
-    logger.info(f"Progress: {percentage:.1f}% ({downloaded}/{total}) - Speed: {speed_mb:.2f} MB/s")
-
 @client.on(events.NewMessage(pattern='/start'))
 async def start_handler(event):
     """Handle /start command"""
@@ -190,9 +180,9 @@ async def file_handler(event):
             except:
                 pass
         
-        # Download the file
+        # Download the file - FIXED: Use event.message directly
         file_path = await FileHandler.download_file(
-            await event.get_message(),
+            event.message,  # Fixed: Use event.message instead of event.get_message()
             progress_callback=update_progress
         )
         
