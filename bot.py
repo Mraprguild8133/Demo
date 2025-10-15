@@ -1,7 +1,7 @@
 import os
 import asyncio
 import logging
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict
 from datetime import datetime
 from pathlib import Path
 
@@ -12,7 +12,7 @@ from pyrogram.errors import RPCError
 import aiofiles
 from aiohttp import web
 import secrets
-import tgcrypto
+import TgCrypto
 
 from config import config
 
@@ -34,6 +34,10 @@ app = Client(
 
 # In-memory storage for file links (use database in production)
 file_links = {}
+
+# Message deduplication tracking
+processing_messages: Dict[int, bool] = {}
+completed_messages: Dict[int, bool] = {}
 
 class ProgressTracker:
     """Track upload/download progress with callbacks"""
@@ -158,6 +162,43 @@ class FileHandler:
         domain = getattr(config, 'DOMAIN', 'localhost:8080')
         return f"https://{domain}/download/{token}"
 
+def is_message_processing(message_id: int) -> bool:
+    """Check if a message is currently being processed"""
+    return processing_messages.get(message_id, False)
+
+def mark_message_processing(message_id: int, processing: bool = True):
+    """Mark a message as being processed or not"""
+    if processing:
+        processing_messages[message_id] = True
+    else:
+        processing_messages.pop(message_id, None)
+
+def is_message_completed(message_id: int) -> bool:
+    """Check if a message has already been processed"""
+    return completed_messages.get(message_id, False)
+
+def mark_message_completed(message_id: int):
+    """Mark a message as completed processing"""
+    completed_messages[message_id] = True
+    # Clean up processing flag
+    mark_message_processing(message_id, False)
+
+async def cleanup_old_messages():
+    """Clean up old message tracking to prevent memory leaks"""
+    try:
+        # Keep only the last 1000 messages to prevent memory issues
+        max_messages = 1000
+        if len(completed_messages) > max_messages:
+            # Remove oldest messages
+            keys_to_remove = list(completed_messages.keys())[:len(completed_messages) - max_messages]
+            for key in keys_to_remove:
+                completed_messages.pop(key, None)
+                processing_messages.pop(key, None)
+        
+        logger.debug(f"Message tracking: {len(processing_messages)} processing, {len(completed_messages)} completed")
+    except Exception as e:
+        logger.error(f"Cleanup error: {e}")
+
 @app.on_message(filters.command("start"))
 async def start_handler(client, message: Message):
     """Handle /start command"""
@@ -208,10 +249,23 @@ async def help_handler(client, message: Message):
     group=1
 )
 async def file_handler(client, message: Message):
-    """Handle incoming files"""
+    """Handle incoming files with deduplication"""
+    
+    # Check if message is already being processed or completed
+    if is_message_processing(message.id):
+        logger.info(f"Message {message.id} is already being processed, skipping")
+        return
+    
+    if is_message_completed(message.id):
+        logger.info(f"Message {message.id} has already been processed, skipping")
+        return
+    
+    # Mark message as being processed
+    mark_message_processing(message.id, True)
+    
     try:
         user = message.from_user
-        logger.info(f"File received from user {user.id}")
+        logger.info(f"File received from user {user.id} (message {message.id})")
         
         # Send initial progress message
         progress_msg = await message.reply_text("📥 **Downloading file...**\n`0%` - Preparing download")
@@ -294,11 +348,21 @@ async def file_handler(client, message: Message):
             reply_markup=keyboard
         )
         
+        # Mark message as completed
+        mark_message_completed(message.id)
+        
+        # Clean up old messages periodically
+        await cleanup_old_messages()
+        
     except RPCError as e:
         logger.error(f"Telegram RPC error: {e}")
+        # Remove processing flag on error
+        mark_message_processing(message.id, False)
         await message.reply_text("❌ **Telegram error. Please try again.**")
     except Exception as e:
         logger.error(f"File handling error: {e}")
+        # Remove processing flag on error
+        mark_message_processing(message.id, False)
         error_msg = await message.reply_text("❌ **Error processing file. Please try again.**")
         # Delete error message after 10 seconds
         await asyncio.sleep(10)
@@ -317,9 +381,12 @@ async def status_handler(client, message: Message):
 • Progress tracking: ✅ Active
 • Large file support: ✅ Up to 4GB
 • File links: ✅ Working
+• Duplicate protection: ✅ Active
 
 **Storage:**
 • Active links: `{len(file_links)}`
+• Processing messages: `{len(processing_messages)}`
+• Completed messages: `{len(completed_messages)}`
 • Max file size: `4 GB`
 • Supported types: `All files`
 
@@ -328,30 +395,38 @@ async def status_handler(client, message: Message):
 • `/help` - Show help
 • `/status` - Show this status
 • `/cleanup` - Cleanup storage
+• `/stats` - Show statistics
     """
     
     await message.reply_text(status_text, parse_mode="markdown")
 
 @app.on_message(filters.command("cleanup"))
 async def cleanup_handler(client, message: Message):
-    """Clean up expired file links"""
+    """Clean up expired file links and message tracking"""
     try:
-        # Simple cleanup - remove some old links if we have too many
+        # Clean up file links
         max_links = 1000
         if len(file_links) > max_links:
-            # Remove oldest links (simple implementation)
             keys_to_remove = list(file_links.keys())[:len(file_links) - max_links]
-            expired_count = len(keys_to_remove)
+            expired_links_count = len(keys_to_remove)
             for key in keys_to_remove:
                 del file_links[key]
         else:
-            expired_count = 0
+            expired_links_count = 0
+        
+        # Clean up message tracking
+        await cleanup_old_messages()
+        cleaned_messages = len(processing_messages) + len(completed_messages) - 1000
+        if cleaned_messages < 0:
+            cleaned_messages = 0
         
         cleanup_text = f"""
 🧹 **Cleanup Completed**
 
-• Expired links removed: `{expired_count}`
+• Expired links removed: `{expired_links_count}`
+• Message tracking cleaned: `{cleaned_messages}`
 • Active links remaining: `{len(file_links)}`
+• Active messages tracking: `{len(processing_messages) + len(completed_messages)}`
 • Storage optimized: ✅
         """
         
@@ -422,11 +497,16 @@ async def stats_handler(client, message: Message):
 • Local files: `{total_files}`
 • Local storage used: `{total_size_mb:.2f} MB`
 
+**Message Tracking:**
+• Processing messages: `{len(processing_messages)}`
+• Completed messages: `{len(completed_messages)}`
+
 **Performance:**
 • Pyrogram: ✅ Optimized
 • TgCrypto: ✅ Encrypted
 • Async: ✅ High-speed
 • Progress: ✅ Real-time
+• Duplicate protection: ✅ Active
 
 **Limits:**
 • Max file size: `4 GB`
@@ -504,10 +584,11 @@ async def main():
     logger.info("- Progress tracking")
     logger.info("- 4GB file support")
     logger.info("- Download link generation")
+    logger.info("- Duplicate message protection")
     
     # Keep running
     await asyncio.Event().wait()
-
+    
 if __name__ == '__main__':
     # Create necessary directories
     os.makedirs('downloads', exist_ok=True)
