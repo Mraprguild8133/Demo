@@ -36,17 +36,20 @@ class ProgressTracker:
         self.start_time = datetime.now()
         self.operation = operation
         
-    def update(self, received: int, total: int):
-        """Progress callback for Telethon - FIXED signature"""
-        self.downloaded = received
-        percentage = (received / total) * 100 if total > 0 else 0
+    def create_callback(self):
+        """Create a Telethon-compatible progress callback"""
+        def telethon_callback(received_bytes, total_bytes):
+            """Telethon progress callback - receives (received_bytes, total_bytes)"""
+            percentage = (received_bytes / total_bytes) * 100 if total_bytes > 0 else 0
+            
+            # Calculate speed
+            elapsed = (datetime.now() - self.start_time).total_seconds()
+            speed = received_bytes / elapsed if elapsed > 0 else 0
+            
+            # Call our custom progress callback
+            self.callback(received_bytes, total_bytes, percentage, speed, self.operation)
         
-        # Calculate speed
-        elapsed = (datetime.now() - self.start_time).total_seconds()
-        speed = received / elapsed if elapsed > 0 else 0
-        
-        # Call the progress callback with our formatted data
-        self.callback(received, total, percentage, speed, self.operation)
+        return telethon_callback
 
 class FileHandler:
     """Handle file operations asynchronously"""
@@ -67,14 +70,15 @@ class FileHandler:
             os.makedirs('downloads', exist_ok=True)
             file_path = f"downloads/{file_name}"
             
-            # FIXED: Create progress tracker with correct callback signature
+            # FIXED: Create proper Telethon-compatible progress callback
             if progress_callback:
                 progress_tracker = ProgressTracker(file_size, progress_callback, "Downloading")
+                telethon_callback = progress_tracker.create_callback()
                 
                 # Download file with progress tracking
                 await message.download_media(
                     file=file_path,
-                    progress_callback=progress_tracker.update  # FIXED: No lambda needed
+                    progress_callback=telethon_callback
                 )
             else:
                 # Download without progress tracking
@@ -98,16 +102,17 @@ class FileHandler:
             file_size = os.path.getsize(file_path)
             logger.info(f"Uploading {file_path} ({file_size} bytes)")
             
-            # FIXED: Create progress tracker with correct callback signature
+            # FIXED: Create proper Telethon-compatible progress callback
             if progress_callback:
                 progress_tracker = ProgressTracker(file_size, progress_callback, "Uploading")
+                telethon_callback = progress_tracker.create_callback()
                 
                 # Upload file with progress tracking
                 message = await client.send_file(
                     chat_id,
                     file_path,
                     force_document=True,
-                    progress_callback=progress_tracker.update  # FIXED: No lambda needed
+                    progress_callback=telethon_callback
                 )
             else:
                 # Upload without progress tracking
@@ -189,11 +194,13 @@ async def file_handler(event):
         # Send initial progress message
         progress_msg = await event.reply("📥 **Downloading file...**\n`0%` - Preparing download")
         
-        # FIXED: Updated progress callback with correct parameters
+        # FIXED: Progress callback with correct parameters
         async def update_progress(received, total, percentage, speed, operation):
             speed_mb = speed / (1024 * 1024) if speed > 0 else 0
             if total > 0:
-                progress_text = f"📥 **{operation}...**\n`{percentage:.1f}%` - {speed_mb:.1f} MB/s"
+                received_mb = received / (1024 * 1024)
+                total_mb = total / (1024 * 1024)
+                progress_text = f"📥 **{operation}...**\n`{percentage:.1f}%` ({received_mb:.1f}/{total_mb:.1f} MB) - {speed_mb:.1f} MB/s"
             else:
                 progress_text = f"📥 **{operation}...**\n`Preparing...`"
             
@@ -202,9 +209,9 @@ async def file_handler(event):
             except Exception as e:
                 logger.debug(f"Progress update error: {e}")
         
-        # Download the file
+        # FIXED: Use event.message directly (not event.get_message())
         file_path = await FileHandler.download_file(
-            event.message,
+            event.message,  # CORRECT: event.message is the message object
             progress_callback=update_progress
         )
         
@@ -241,6 +248,7 @@ async def file_handler(event):
         # Clean up local file
         try:
             os.remove(file_path)
+            logger.info(f"Cleaned up local file: {file_path}")
         except Exception as e:
             logger.warning(f"Could not remove file {file_path}: {e}")
         
@@ -248,12 +256,15 @@ async def file_handler(event):
         
     except Exception as e:
         logger.error(f"File handling error: {e}")
-        await event.reply(f"❌ **Error processing file:** {str(e)}")
+        error_msg = await event.reply("❌ **Error processing file. Please try again.**")
+        # Delete error message after 10 seconds
+        await asyncio.sleep(10)
+        await error_msg.delete()
 
 @client.on(events.NewMessage(pattern='/status'))
 async def status_handler(event):
     """Show bot status"""
-    status_text = """
+    status_text = f"""
 🟢 **Bot Status: Online**
 
 **System Information:**
@@ -263,7 +274,7 @@ async def status_handler(event):
 • File links: ✅ Working
 
 **Storage:**
-• Active links: `{links_count}`
+• Active links: `{len(file_links)}`
 • Max file size: `4 GB`
 • Supported types: `All files`
 
@@ -271,7 +282,7 @@ async def status_handler(event):
 • Send any file to upload
 • `/help` - Show help
 • `/status` - Show this status
-    """.format(links_count=len(file_links))
+    """
     
     await event.reply(status_text, parse_mode='markdown')
 
@@ -279,14 +290,16 @@ async def status_handler(event):
 async def cleanup_handler(event):
     """Clean up expired file links"""
     try:
-        # Simple cleanup - in production, implement proper expiration logic
-        expired_count = 0
-        current_time = datetime.now()
-        
-        # This is a basic implementation - enhance with proper TTL logic
-        if hasattr(config, 'FILE_LINK_TTL'):
-            # Implement TTL-based cleanup here
-            pass
+        # Simple cleanup - remove some old links if we have too many
+        max_links = 1000
+        if len(file_links) > max_links:
+            # Remove oldest links (simple implementation)
+            keys_to_remove = list(file_links.keys())[:len(file_links) - max_links]
+            expired_count = len(keys_to_remove)
+            for key in keys_to_remove:
+                del file_links[key]
+        else:
+            expired_count = 0
         
         cleanup_text = f"""
 🧹 **Cleanup Completed**
@@ -301,6 +314,30 @@ async def cleanup_handler(event):
     except Exception as e:
         logger.error(f"Cleanup error: {e}")
         await event.reply(f"❌ **Cleanup error:** {str(e)}")
+
+@client.on(events.NewMessage(pattern='/info'))
+async def info_handler(event):
+    """Show file info before processing"""
+    try:
+        if event.file:
+            file_name = event.file.name or f"file_{event.id}"
+            file_size = event.file.size
+            file_size_mb = file_size / (1024 * 1024)
+            
+            info_text = f"""
+📁 **File Information:**
+
+**Name:** `{file_name}`
+**Size:** `{file_size_mb:.2f} MB`
+**Type:** `{event.file.mime_type or 'Unknown'}`
+
+Send the file to start upload process.
+            """
+            await event.reply(info_text, parse_mode='markdown')
+        else:
+            await event.reply("❌ Please send a file to get information.")
+    except Exception as e:
+        logger.error(f"Info handler error: {e}")
 
 # Web server for download links (basic implementation)
 async def handle_download(request):
