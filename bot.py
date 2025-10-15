@@ -29,17 +29,24 @@ file_links = {}
 class ProgressTracker:
     """Track upload/download progress with callbacks"""
     
-    def __init__(self, total_size: int, callback: Callable):
+    def __init__(self, total_size: int, callback: Callable, operation: str = "Downloading"):
         self.total_size = total_size
         self.callback = callback
         self.downloaded = 0
         self.start_time = datetime.now()
+        self.operation = operation
         
-    def update(self, chunk_size: int):
-        self.downloaded += chunk_size
-        percentage = (self.downloaded / self.total_size) * 100
-        speed = self.downloaded / (datetime.now() - self.start_time).total_seconds()
-        self.callback(self.downloaded, self.total_size, percentage, speed)
+    def update(self, received: int, total: int):
+        """Progress callback for Telethon - FIXED signature"""
+        self.downloaded = received
+        percentage = (received / total) * 100 if total > 0 else 0
+        
+        # Calculate speed
+        elapsed = (datetime.now() - self.start_time).total_seconds()
+        speed = received / elapsed if elapsed > 0 else 0
+        
+        # Call the progress callback with our formatted data
+        self.callback(received, total, percentage, speed, self.operation)
 
 class FileHandler:
     """Handle file operations asynchronously"""
@@ -60,15 +67,18 @@ class FileHandler:
             os.makedirs('downloads', exist_ok=True)
             file_path = f"downloads/{file_name}"
             
-            progress_tracker = None
+            # FIXED: Create progress tracker with correct callback signature
             if progress_callback:
-                progress_tracker = ProgressTracker(file_size, progress_callback)
-            
-            # Download file with progress tracking
-            await message.download_media(
-                file=file_path,
-                progress_callback=progress_tracker.update if progress_tracker else None
-            )
+                progress_tracker = ProgressTracker(file_size, progress_callback, "Downloading")
+                
+                # Download file with progress tracking
+                await message.download_media(
+                    file=file_path,
+                    progress_callback=progress_tracker.update  # FIXED: No lambda needed
+                )
+            else:
+                # Download without progress tracking
+                await message.download_media(file=file_path)
             
             logger.info(f"Download completed: {file_path}")
             return file_path
@@ -88,17 +98,24 @@ class FileHandler:
             file_size = os.path.getsize(file_path)
             logger.info(f"Uploading {file_path} ({file_size} bytes)")
             
-            progress_tracker = None
+            # FIXED: Create progress tracker with correct callback signature
             if progress_callback:
-                progress_tracker = ProgressTracker(file_size, progress_callback)
-            
-            # Upload file
-            message = await client.send_file(
-                chat_id,
-                file_path,
-                force_document=True,
-                progress_callback=progress_tracker.update if progress_tracker else None
-            )
+                progress_tracker = ProgressTracker(file_size, progress_callback, "Uploading")
+                
+                # Upload file with progress tracking
+                message = await client.send_file(
+                    chat_id,
+                    file_path,
+                    force_document=True,
+                    progress_callback=progress_tracker.update  # FIXED: No lambda needed
+                )
+            else:
+                # Upload without progress tracking
+                message = await client.send_file(
+                    chat_id,
+                    file_path,
+                    force_document=True
+                )
             
             logger.info(f"Upload completed: {file_path}")
             return message.media
@@ -172,36 +189,33 @@ async def file_handler(event):
         # Send initial progress message
         progress_msg = await event.reply("📥 **Downloading file...**\n`0%` - Preparing download")
         
-        async def update_progress(downloaded, total, percentage, speed):
-            speed_mb = speed / (1024 * 1024)
-            progress_text = f"📥 **Downloading file...**\n`{percentage:.1f}%` - {speed_mb:.1f} MB/s"
+        # FIXED: Updated progress callback with correct parameters
+        async def update_progress(received, total, percentage, speed, operation):
+            speed_mb = speed / (1024 * 1024) if speed > 0 else 0
+            if total > 0:
+                progress_text = f"📥 **{operation}...**\n`{percentage:.1f}%` - {speed_mb:.1f} MB/s"
+            else:
+                progress_text = f"📥 **{operation}...**\n`Preparing...`"
+            
             try:
                 await progress_msg.edit(progress_text)
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Progress update error: {e}")
         
-        # Download the file - FIXED: Use event.message directly
+        # Download the file
         file_path = await FileHandler.download_file(
-            event.message,  # Fixed: Use event.message instead of event.get_message()
+            event.message,
             progress_callback=update_progress
         )
         
         # Update message for upload
         await progress_msg.edit("📤 **Uploading to storage...**\n`0%` - Preparing upload")
         
-        async def update_upload_progress(downloaded, total, percentage, speed):
-            speed_mb = speed / (1024 * 1024)
-            progress_text = f"📤 **Uploading to storage...**\n`{percentage:.1f}%` - {speed_mb:.1f} MB/s"
-            try:
-                await progress_msg.edit(progress_text)
-            except:
-                pass
-        
-        # Re-upload to get permanent file ID (in production, use proper storage)
+        # Upload the file
         uploaded_media = await FileHandler.upload_file(
             file_path,
             event.chat_id,
-            progress_callback=update_upload_progress
+            progress_callback=update_progress
         )
         
         # Generate download link
@@ -227,8 +241,8 @@ async def file_handler(event):
         # Clean up local file
         try:
             os.remove(file_path)
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"Could not remove file {file_path}: {e}")
         
         await progress_msg.edit(success_text, parse_mode='markdown')
         
@@ -299,7 +313,6 @@ async def handle_download(request):
     file_id = file_links[token]
     
     # In production, implement proper file serving
-    # For now, we'll redirect to Telegram file
     return web.Response(
         text=f"""
         Download Link for File ID: {file_id}
