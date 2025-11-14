@@ -1,25 +1,59 @@
 import base64
 import os
 import secrets
-import json
 import asyncio
+import traceback
+import urllib.parse
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup
-from pyrogram.errors import FloodWait
+from pyrogram.errors import FloodWait, UserNotParticipant
 
-# Import configuration from external file
 from config import config
 
-# --- FIREBASE / PERSISTENCE MOCK ---
+# --- SIMPLE DATABASE MOCK ---
 FILE_LINK_DB = {}
+USER_DB = {}
 
-def save_file_data(app_id: str, file_key: str, data: dict):
-    """Mocks saving file data to Firestore."""
+class MockMongoDB:
+    """Mock MongoDB class to prevent errors"""
+    
+    async def present_user(self, user_id):
+        return USER_DB.get(user_id) is not None
+    
+    async def add_user(self, user_id):
+        USER_DB[user_id] = {"joined_at": asyncio.get_event_loop().time()}
+        return True
+    
+    async def is_banned(self, user_id):
+        return False
+    
+    async def add_fsub_channel(self, channel_id, channel_data):
+        print(f"Mock DB: Added FSub channel {channel_id}")
+        return True
+    
+    async def remove_fsub_channel(self, channel_id):
+        print(f"Mock DB: Removed FSub channel {channel_id}")
+        return True
+    
+    async def set_channels(self, channels):
+        print(f"Mock DB: Set channels {channels}")
+        return True
+    
+    async def set_shortner_status(self, status):
+        print(f"Mock DB: Set shortner status {status}")
+        return True
+    
+    async def update_shortner_setting(self, key, value):
+        print(f"Mock DB: Updated shortner {key} = {value}")
+        return True
+
+def save_file_data(file_key: str, data: dict):
+    """Save file data to mock database."""
     FILE_LINK_DB[file_key] = data
-    print(f"MOCK DB: Saved data for key: {file_key}. Current DB size: {len(FILE_LINK_DB)}")
+    print(f"DB: Saved file data for key: {file_key}")
 
-def get_file_data(app_id: str, file_key: str) -> dict | None:
-    """Mocks retrieving file data from Firestore."""
+def get_file_data(file_key: str) -> dict | None:
+    """Retrieve file data from mock database."""
     return FILE_LINK_DB.get(file_key)
 
 # --- UTILITY FUNCTIONS ---
@@ -45,29 +79,21 @@ def format_size(size_bytes):
 
 def create_share_keyboard(share_link: str, file_name: str, base64_key: str) -> InlineKeyboardMarkup:
     """Create an inline keyboard with working share buttons."""
-    # URL encode the file name for the share message
-    import urllib.parse
-    encoded_file_name = urllib.parse.quote(file_name)
-    
-    # Create the share message text
     share_text = f"📁 Download {file_name} via File Share Bot"
     
     keyboard = [
-        # Button 1: Direct bot start (THIS WILL WORK)
         [
             InlineKeyboardButton(
                 "🚀 Get File Now", 
-                url=f"https://t.me/{config.BOT_USERNAME}?start={base64_key}"
+                url=share_link
             )
         ],
-        # Button 2: Copy to clipboard (with visual feedback)
         [
             InlineKeyboardButton(
                 "📋 Copy Link", 
                 callback_data=f"copy_{base64_key}"
             )
         ],
-        # Button 3: Share to other chats (THIS WILL WORK)
         [
             InlineKeyboardButton(
                 "📤 Share to Friends", 
@@ -90,26 +116,75 @@ app = Client(
 # Store bot username globally
 BOT_USERNAME = None
 
+# Initialize required attributes for plugins
+app.fsub_dict = {}
+app.req_channels = []
+app.mongodb = MockMongoDB()
+app.admins = config.ADMINS
+app.shortner_enabled = False  # Disable shortner for file bot
+app.db = None  # Channel ID for posts
+app.disable_btn = False
+
+async def check_force_sub(user_id: int) -> tuple:
+    """
+    Check if user is subscribed to required channels.
+    Returns (True, None) if subscribed, (False, button) if not.
+    """
+    if not app.fsub_dict:
+        return True, None
+    
+    for channel_id, channel_data in app.fsub_dict.items():
+        try:
+            await app.get_chat_member(channel_id, user_id)
+        except UserNotParticipant:
+            channel_name = channel_data[0] if channel_data else "the channel"
+            invite_link = channel_data[1] if channel_data and len(channel_data) > 1 else None
+            
+            if invite_link:
+                button = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"Join {channel_name}", url=invite_link)],
+                    [InlineKeyboardButton("✅ I've Joined", callback_data="check_fsub")]
+                ])
+            else:
+                button = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(f"Join {channel_name}", url=f"https://t.me/c/{str(channel_id)[4:]}")],
+                    [InlineKeyboardButton("✅ I've Joined", callback_data="check_fsub")]
+                ])
+            
+            return False, button
+        except Exception as e:
+            print(f"Error checking channel membership: {e}")
+            continue
+    
+    return True, None
+
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client: Client, message: Message):
-    """
-    Handles the /start command, especially when a file link is used.
-    """
+    """Handle /start command with file links."""
     global BOT_USERNAME
     if not BOT_USERNAME and client.me:
         BOT_USERNAME = client.me.username
 
-    # Extract the base64 argument after /start
+    # Check force subscription
+    is_subscribed, button = await check_force_sub(message.from_user.id)
+    if not is_subscribed:
+        await message.reply_text(
+            "📢 **Subscription Required**\n\n"
+            "You need to join our channel to use this bot.\n"
+            "Please join the channel below and then click 'I've Joined'.",
+            reply_markup=button
+        )
+        return
+
+    # Handle file links
     if len(message.command) > 1:
         base64_key = message.command[1]
+        print(f"Processing file request with key: {base64_key}")
         
-        # Retrieve file data from the mock database
-        file_data = get_file_data("file_bot_v1", base64_key)
+        file_data = get_file_data(base64_key)
 
         if not file_data:
-            await message.reply_text(
-                "❌ **Error:** File link is invalid or expired. Please upload a file to generate a new link."
-            )
+            await message.reply_text("❌ **Error:** File link is invalid or expired.")
             return
 
         file_id = file_data.get('file_id')
@@ -120,29 +195,25 @@ async def start_handler(client: Client, message: Message):
             f"📥 **File Ready for Download**\n\n"
             f"**File:** `{file_name}`\n"
             f"**Size:** `{format_size(file_size_bytes)}`\n\n"
-            f"✅ Click below to download instantly!"
+            f"✅ Downloaded successfully!"
         )
 
         try:
-            # Send the actual file using the retrieved file_id
             await client.send_document(
                 chat_id=message.chat.id,
                 document=file_id,
                 caption=caption_text
             )
+            print("File sent successfully")
 
         except FloodWait as e:
-            await message.reply_text(f"⚠️ **Rate Limit:** Please wait {e.value} seconds before trying again.")
+            await message.reply_text(f"⚠️ **Rate Limit:** Please wait {e.value} seconds.")
         except Exception as e:
             print(f"Error sending file: {e}")
-            await message.reply_text("❌ An unexpected error occurred while sending the file.")
+            await message.reply_text("❌ Error sending file. Please try again.")
 
     else:
-        # Standard /start message
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📤 Upload a File", switch_inline_query="")]
-        ])
-        
+        # Welcome message
         await message.reply_text(
             "👋 **Welcome to File Share Bot!**\n\n"
             "**How to use:**\n"
@@ -153,38 +224,49 @@ async def start_handler(client: Client, message: Message):
             "• Instant download speeds\n"
             "• Files up to 4GB supported\n"
             "• Permanent links\n"
-            "• Easy sharing options",
-            reply_markup=keyboard
+            "• Easy sharing options"
         )
 
 @app.on_message(filters.document & filters.private)
 async def file_handler(client: Client, message: Message):
-    """
-    Handles uploaded documents, stores their ID, and generates the special link.
-    """
+    """Handle file uploads and generate share links."""
     global BOT_USERNAME
     if not BOT_USERNAME and client.me:
         BOT_USERNAME = client.me.username
 
     try:
+        print(f"Processing file upload from user: {message.from_user.id}")
+        
+        # Check force subscription
+        is_subscribed, button = await check_force_sub(message.from_user.id)
+        if not is_subscribed:
+            await message.reply_text(
+                "📢 **Subscription Required**\n\n"
+                "You need to join our channel to upload files.",
+                reply_markup=button
+            )
+            return
+
         if not message.document:
             await message.reply_text("Please upload a file document.")
             return
 
-        # Check for large file
+        # Check file size
         file_size_bytes = message.document.file_size
         if file_size_bytes and file_size_bytes > 4 * 1024 * 1024 * 1024:
-            await message.reply_text("❌ File is too large. Telegram limits: 4GB max.")
+            await message.reply_text("❌ File is too large. Maximum size: 4GB")
             return
 
         # Get file details
         file_id = message.document.file_id
         file_name = message.document.file_name or "Unnamed File"
+        
+        print(f"Processing file: {file_name} ({file_size_bytes} bytes)")
 
         # Generate unique key
         base64_key = generate_base64_key()
 
-        # Prepare data to store
+        # Prepare and save file data
         file_data = {
             'file_id': file_id,
             'file_name': file_name,
@@ -193,10 +275,9 @@ async def file_handler(client: Client, message: Message):
             'timestamp': message.date.isoformat() if message.date else None
         }
 
-        # Save file metadata
-        save_file_data("file_bot_v1", base64_key, file_data)
+        save_file_data(base64_key, file_data)
 
-        # Construct the share link
+        # Create share link
         if BOT_USERNAME:
             share_link = f"https://t.me/{BOT_USERNAME}?start={base64_key}"
             
@@ -207,7 +288,6 @@ async def file_handler(client: Client, message: Message):
                 "**Choose an option below:**"
             )
             
-            # Create keyboard with WORKING buttons
             keyboard = create_share_keyboard(share_link, file_name, base64_key)
             
             await message.reply_text(
@@ -215,39 +295,49 @@ async def file_handler(client: Client, message: Message):
                 reply_markup=keyboard,
                 disable_web_page_preview=True
             )
+            print("Share link sent successfully")
         else:
-            await message.reply_text(
-                f"✅ File saved! Use this key: `{base64_key}`"
-            )
+            await message.reply_text(f"✅ File saved! Key: `{base64_key}`")
 
     except Exception as e:
-        print(f"Error handling file upload: {e}")
-        await message.reply_text("❌ An error occurred while processing your file.")
+        print(f"❌ ERROR in file_handler: {e}")
+        print(traceback.format_exc())
+        await message.reply_text("❌ Error processing file. Please try again.")
 
 @app.on_callback_query()
 async def handle_callbacks(client, callback_query):
     """Handle button callbacks."""
-    data = callback_query.data
-    
-    if data.startswith("copy_"):
-        base64_key = data[5:]  # Remove "copy_" prefix
+    try:
+        data = callback_query.data
         
-        if BOT_USERNAME:
-            share_link = f"https://t.me/{BOT_USERNAME}?start={base64_key}"
+        if data.startswith("copy_"):
+            base64_key = data[5:]
             
-            # Show confirmation
-            await callback_query.answer(
-                "📋 Link copied to clipboard! You can now paste it anywhere.",
-                show_alert=False
-            )
-            
-            # Also send as a message for easy copying
-            await callback_query.message.reply_text(
-                f"**Here's your share link:**\n\n`{share_link}`\n\n"
-                "You can select and copy this text to share with others."
-            )
-        else:
-            await callback_query.answer("Error: Could not generate link", show_alert=True)
+            if BOT_USERNAME:
+                share_link = f"https://t.me/{BOT_USERNAME}?start={base64_key}"
+                
+                await callback_query.answer(
+                    "📋 Link copied to clipboard!",
+                    show_alert=False
+                )
+                
+                await callback_query.message.reply_text(
+                    f"**Here's your share link:**\n\n`{share_link}`\n\n"
+                    "You can select and copy this text to share with others."
+                )
+        
+        elif data == "check_fsub":
+            # Check if user joined after clicking the button
+            is_subscribed, button = await check_force_sub(callback_query.from_user.id)
+            if is_subscribed:
+                await callback_query.answer("✅ Thanks for joining! You can now use the bot.", show_alert=True)
+                await callback_query.message.delete()
+            else:
+                await callback_query.answer("❌ Please join the channel first.", show_alert=True)
+                
+    except Exception as e:
+        print(f"Callback error: {e}")
+        await callback_query.answer("Error processing request", show_alert=True)
 
 @app.on_message(filters.command("stats") & filters.private)
 async def stats_handler(client: Client, message: Message):
@@ -255,16 +345,13 @@ async def stats_handler(client: Client, message: Message):
     stats_text = (
         f"📊 **Bot Statistics**\n\n"
         f"• **Files stored:** {len(FILE_LINK_DB)}\n"
+        f"• **Total users:** {len(USER_DB)}\n"
         f"• **Bot username:** @{BOT_USERNAME or 'Loading...'}\n"
+        f"• **Force sub channels:** {len(app.fsub_dict)}\n"
         f"• **Storage:** Temporary (resets on restart)"
     )
     
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_stats")],
-        [InlineKeyboardButton("📤 Upload File", switch_inline_query="")]
-    ])
-    
-    await message.reply_text(stats_text, reply_markup=keyboard)
+    await message.reply_text(stats_text)
 
 @app.on_message(filters.command("help") & filters.private)
 async def help_handler(client: Client, message: Message):
@@ -285,29 +372,67 @@ async def help_handler(client: Client, message: Message):
         "• 📤 Share to Friends - Share via Telegram"
     )
     
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 Try It Now - Upload File", switch_inline_query="")]
-    ])
-    
-    await message.reply_text(help_text, reply_markup=keyboard)
+    await message.reply_text(help_text)
+
+# Admin commands
+@app.on_message(filters.command("addfsub") & filters.private & filters.user(config.ADMINS))
+async def add_fsub_admin(client: Client, message: Message):
+    """Admin command to add force sub channel."""
+    try:
+        if len(message.command) < 2:
+            await message.reply_text("Usage: /addfsub channel_id")
+            return
+        
+        channel_id = int(message.command[1])
+        chat = await client.get_chat(channel_id)
+        
+        app.fsub_dict[channel_id] = [chat.title, None, False, 0]
+        
+        await message.reply_text(f"✅ Added channel: {chat.title}")
+        
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {e}")
+
+@app.on_message(filters.command("delfsub") & filters.private & filters.user(config.ADMINS))
+async def del_fsub_admin(client: Client, message: Message):
+    """Admin command to remove force sub channel."""
+    try:
+        if len(message.command) < 2:
+            await message.reply_text("Usage: /delfsub channel_id")
+            return
+        
+        channel_id = int(message.command[1])
+        if channel_id in app.fsub_dict:
+            app.fsub_dict.pop(channel_id)
+            await message.reply_text("✅ Removed channel from force sub")
+        else:
+            await message.reply_text("❌ Channel not found in force sub list")
+            
+    except Exception as e:
+        await message.reply_text(f"❌ Error: {e}")
 
 # --- MAIN EXECUTION BLOCK ---
 async def main():
     """Starts the bot and keeps it running."""
     global BOT_USERNAME
     
-    print("Starting Telegram File Share Bot...")
+    print("🚀 Starting Telegram File Share Bot...")
     await app.start()
     
     if app.me:
         BOT_USERNAME = app.me.username
-        print(f"Bot started as @{BOT_USERNAME}")
-        print("✅ Bot is ready! Users can upload files and get share links.")
+        print(f"✅ Bot started as @{BOT_USERNAME}")
+        print("📁 Bot is ready! Users can upload files and get share links.")
+        
+        # Initialize admin user if needed
+        if app.me.id not in app.admins:
+            app.admins.append(app.me.id)
+            
     else:
         print("❌ Bot started, but could not retrieve username.")
 
     await idle()
-    print("Stopping bot...")
+    print("🛑 Stopping bot...")
     await app.stop()
 
 if __name__ == "__main__":
@@ -316,4 +441,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("Bot stopped by user.")
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Fatal error: {e}")
+        print(traceback.format_exc())
