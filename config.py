@@ -1,5 +1,4 @@
 import os
-from typing import Optional
 
 class Config:
     """Configuration class for the Telegram File Share Bot."""
@@ -9,14 +8,8 @@ class Config:
     API_HASH: str = os.getenv("TELEGRAM_API_HASH", "your_api_hash_here")
     BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "your_bot_token_here")
     
-    # Application ID for Firestore path simulation
-    APP_ID: str = os.getenv("APP_ID", "file_bot_v1")
-    
-    # Optional: Maximum file size in bytes (4GB default)
-    MAX_FILE_SIZE: int = 4 * 1024 * 1024 * 1024
-    
-    # Optional: Database configuration for future use
-    USE_REAL_FIRESTORE: bool = os.getenv("USE_REAL_FIRESTORE", "false").lower() == "true"
+    # Bot username (will be set automatically)
+    BOT_USERNAME: str = None
     
     @classmethod
     def validate(cls):
@@ -36,9 +29,8 @@ class Config:
 # Create config instance
 config = Config()
 
-# Validate configuration on import
+# Validate configuration
 try:
     config.validate()
 except ValueError as e:
     print(f"Configuration error: {e}")
-    print("Please set the required environment variables or update config.py")
