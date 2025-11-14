@@ -13,7 +13,6 @@ from pyrogram.errors import FloodWait, UserNotParticipant
 from config import config
 
 # --- SIMPLE DATABASE MOCK ---
-# Using JSON file for persistence instead of in-memory dict
 DB_FILE = "file_database.json"
 
 def load_database():
@@ -21,9 +20,16 @@ def load_database():
     try:
         if os.path.exists(DB_FILE):
             with open(DB_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+                # Ensure the structure is correct
+                if "files" not in data:
+                    data["files"] = {}
+                if "users" not in data:
+                    data["users"] = {}
+                return data
     except Exception as e:
         print(f"Error loading database: {e}")
+    # Return empty database structure
     return {"files": {}, "users": {}}
 
 def save_database(data):
@@ -72,10 +78,11 @@ def get_database_stats():
     """Get database statistics."""
     try:
         db = load_database()
+        file_keys = list(db["files"].keys())
         return {
             "total_files": len(db["files"]),
             "total_users": len(db["users"]),
-            "file_keys": list(db["files"].keys())[:5]  # First 5 keys for debugging
+            "file_keys": file_keys[:5]  # First 5 keys for debugging
         }
     except Exception as e:
         print(f"Error getting stats: {e}")
@@ -438,7 +445,7 @@ async def main():
     
     # Initialize database
     db = load_database()
-    print(f"📊 Loaded database: {db['total_files']} files, {db['total_users']} users")
+    print(f"📊 Loaded database: {len(db['files'])} files, {len(db['users'])} users")
     
     await app.start()
     
