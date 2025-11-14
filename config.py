@@ -11,12 +11,8 @@ class Config:
     # Bot settings
     ADMINS = [int(x) for x in os.getenv("ADMINS", "").split()] if os.getenv("ADMINS") else []
     
-    # Bot username (will be set automatically, but you can force it here if needed)
-    BOT_USERNAME = os.getenv("BOT_USERNAME", "")  # Optional: set your bot username here
-    
-    # Shortner settings (optional)
-    SHORT_URL = os.getenv("SHORT_URL", "inshorturl.com")
-    SHORT_API = os.getenv("SHORT_API", "")
+    # Bot username (will be set automatically)
+    BOT_USERNAME = os.getenv("BOT_USERNAME", "")
     
     @classmethod
     def validate(cls):
