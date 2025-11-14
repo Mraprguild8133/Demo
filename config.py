@@ -4,12 +4,16 @@ class Config:
     """Configuration class for the Telegram File Share Bot."""
     
     # Telegram API credentials (REQUIRED)
-    API_ID: int = int(os.getenv("TELEGRAM_API_ID", 1234567))
-    API_HASH: str = os.getenv("TELEGRAM_API_HASH", "your_api_hash_here")
-    BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "your_bot_token_here")
+    API_ID = int(os.getenv("TELEGRAM_API_ID", 1234567))
+    API_HASH = os.getenv("TELEGRAM_API_HASH", "your_api_hash_here")
+    BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "your_bot_token_here")
     
-    # Bot username (will be set automatically)
-    BOT_USERNAME: str = mraprguildtestbot
+    # Bot settings
+    ADMINS = [int(x) for x in os.getenv("ADMINS", "").split()] if os.getenv("ADMINS") else []
+    
+    # Shortner settings (optional)
+    SHORT_URL = os.getenv("SHORT_URL", "inshorturl.com")
+    SHORT_API = os.getenv("SHORT_API", "")
     
     @classmethod
     def validate(cls):
@@ -34,3 +38,4 @@ try:
     config.validate()
 except ValueError as e:
     print(f"Configuration error: {e}")
+    print("Please set the required environment variables")
