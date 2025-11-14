@@ -9,7 +9,7 @@ class Config:
     BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "your_bot_token_here")
     
     # Bot username (will be set automatically)
-    BOT_USERNAME: str = None
+    BOT_USERNAME: str = mraprguildtestbot
     
     @classmethod
     def validate(cls):
