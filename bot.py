@@ -1,606 +1,560 @@
 import os
-import asyncio
+import sqlite3
 import logging
-from typing import Optional, Callable, Dict
-from datetime import datetime
-from pathlib import Path
-
-from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from pyrogram.enums import MessageMediaType
-from pyrogram.errors import RPCError
-import aiofiles
-from aiohttp import web
 import secrets
-import tgcrypto
+import asyncio
+from datetime import datetime, timedelta
+from typing import Dict, Optional, List
+
+from telegram import (
+    Update, 
+    InlineKeyboardButton, 
+    InlineKeyboardMarkup,
+    MessageEntity
+)
+from telegram.ext import (
+    Application, 
+    CommandHandler, 
+    MessageHandler, 
+    ContextTypes, 
+    filters, 
+    CallbackQueryHandler
+)
 
 from config import config
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Pyrogram client with TgCrypto
-app = Client(
-    "file_bot",
-    api_id=config.API_ID,
-    api_hash=config.API_HASH,
-    bot_token=config.BOT_TOKEN,
-    in_memory=True
-)
-
-# In-memory storage for file links (use database in production)
-file_links = {}
-
-# Message deduplication tracking
-processing_messages: Dict[int, bool] = {}
-completed_messages: Dict[int, bool] = {}
-
-class ProgressTracker:
-    """Track upload/download progress with callbacks"""
+class DatabaseManager:
+    """Manage database operations"""
     
-    def __init__(self, total_size: int, callback: Callable, operation: str = "Downloading"):
-        self.total_size = total_size
-        self.callback = callback
-        self.processed = 0
-        self.start_time = datetime.now()
-        self.operation = operation
-        
-    def create_callback(self):
-        """Create a Pyrogram-compatible progress callback"""
-        def pyrogram_callback(current, total):
-            """Pyrogram progress callback - receives (current, total)"""
-            percentage = (current / total) * 100 if total > 0 else 0
-            
-            # Calculate speed
-            elapsed = (datetime.now() - self.start_time).total_seconds()
-            speed = current / elapsed if elapsed > 0 else 0
-            
-            # Call our custom progress callback
-            self.callback(current, total, percentage, speed, self.operation)
-        
-        return pyrogram_callback
-
-class FileHandler:
-    """Handle file operations asynchronously with Pyrogram"""
+    def __init__(self):
+        self.db_path = config.DB_PATH
+        self.init_database()
     
-    @staticmethod
-    async def download_file(
-        message: Message,
-        progress_callback: Optional[Callable] = None
-    ) -> str:
-        """Download file with progress tracking"""
-        try:
-            # Get file information
-            if message.document:
-                file_name = message.document.file_name or f"document_{message.id}.bin"
-                file_size = message.document.file_size
-            elif message.video:
-                file_name = message.video.file_name or f"video_{message.id}.mp4"
-                file_size = message.video.file_size
-            elif message.audio:
-                file_name = message.audio.file_name or f"audio_{message.id}.mp3"
-                file_size = message.audio.file_size
-            elif message.photo:
-                file_name = f"photo_{message.id}.jpg"
-                file_size = message.photo.file_size
-            else:
-                file_name = f"file_{message.id}.bin"
-                file_size = 0
-            
-            logger.info(f"Downloading {file_name} ({file_size} bytes)")
-            
-            # Create downloads directory if not exists
-            os.makedirs('downloads', exist_ok=True)
-            file_path = f"downloads/{file_name}"
-            
-            # Create progress callback
-            if progress_callback and file_size > 0:
-                progress_tracker = ProgressTracker(file_size, progress_callback, "Downloading")
-                pyrogram_callback = progress_tracker.create_callback()
-            else:
-                pyrogram_callback = None
-            
-            # Download file with progress tracking
-            await message.download(
-                file_name=file_path,
-                progress=pyrogram_callback,
-                progress_args=(file_size,) if file_size > 0 else None
+    def init_database(self):
+        """Initialize SQLite database with tables"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        # Files table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id TEXT UNIQUE NOT NULL,
+                file_name TEXT NOT NULL,
+                file_type TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                mime_type TEXT,
+                caption TEXT,
+                uploader_id INTEGER NOT NULL,
+                upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                access_count INTEGER DEFAULT 0,
+                is_active BOOLEAN DEFAULT TRUE,
+                last_accessed TIMESTAMP
             )
-            
-            logger.info(f"Download completed: {file_path}")
-            return file_path
-            
-        except Exception as e:
-            logger.error(f"Download error: {e}")
-            raise
-    
-    @staticmethod
-    async def upload_file(
-        file_path: str,
-        chat_id: int,
-        progress_callback: Optional[Callable] = None
-    ) -> Message:
-        """Upload file with progress tracking"""
-        try:
-            file_size = os.path.getsize(file_path)
-            file_name = os.path.basename(file_path)
-            logger.info(f"Uploading {file_path} ({file_size} bytes)")
-            
-            # Create progress callback
-            if progress_callback:
-                progress_tracker = ProgressTracker(file_size, progress_callback, "Uploading")
-                pyrogram_callback = progress_tracker.create_callback()
-            else:
-                pyrogram_callback = None
-            
-            # Upload file with progress tracking
-            message = await app.send_document(
-                chat_id=chat_id,
-                document=file_path,
-                progress=pyrogram_callback,
-                progress_args=(file_size,) if file_size > 0 else None
+        ''')
+        
+        # File links table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS file_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                unique_hash TEXT UNIQUE NOT NULL,
+                created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expiry_date TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE,
+                FOREIGN KEY (file_id) REFERENCES files (id) ON DELETE CASCADE
             )
-            
-            logger.info(f"Upload completed: {file_path}")
-            return message
-            
-        except Exception as e:
-            logger.error(f"Upload error: {e}")
-            raise
-    
-    @staticmethod
-    def generate_download_link(file_id: str) -> str:
-        """Generate unique download link for file"""
-        token = secrets.token_urlsafe(16)
-        file_links[token] = file_id
+        ''')
         
-        # Use domain from config if available, otherwise use localhost
-        domain = getattr(config, 'DOMAIN', 'localhost:8080')
-        return f"https://{domain}/download/{token}"
-
-def is_message_processing(message_id: int) -> bool:
-    """Check if a message is currently being processed"""
-    return processing_messages.get(message_id, False)
-
-def mark_message_processing(message_id: int, processing: bool = True):
-    """Mark a message as being processed or not"""
-    if processing:
-        processing_messages[message_id] = True
-    else:
-        processing_messages.pop(message_id, None)
-
-def is_message_completed(message_id: int) -> bool:
-    """Check if a message has already been processed"""
-    return completed_messages.get(message_id, False)
-
-def mark_message_completed(message_id: int):
-    """Mark a message as completed processing"""
-    completed_messages[message_id] = True
-    # Clean up processing flag
-    mark_message_processing(message_id, False)
-
-async def cleanup_old_messages():
-    """Clean up old message tracking to prevent memory leaks"""
-    try:
-        # Keep only the last 1000 messages to prevent memory issues
-        max_messages = 1000
-        if len(completed_messages) > max_messages:
-            # Remove oldest messages
-            keys_to_remove = list(completed_messages.keys())[:len(completed_messages) - max_messages]
-            for key in keys_to_remove:
-                completed_messages.pop(key, None)
-                processing_messages.pop(key, None)
+        # User stats table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_stats (
+                user_id INTEGER PRIMARY KEY,
+                total_uploads INTEGER DEFAULT 0,
+                total_storage_used INTEGER DEFAULT 0,
+                last_upload_date TIMESTAMP
+            )
+        ''')
         
-        logger.debug(f"Message tracking: {len(processing_messages)} processing, {len(completed_messages)} completed")
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-
-@app.on_message(filters.command("start"))
-async def start_handler(client, message: Message):
-    """Handle /start command"""
-    welcome_text = f"""
-🤖 **Welcome to High-Speed File Bot!** 🚀
-
-**Features:**
-• Upload any files (up to 4GB)
-• Download with generated links
-• Real-time progress tracking
-• High-speed async operations with Pyrogram
-• Secure encryption with TgCrypto
-
-**Commands:**
-• Just send me any file to upload
-• Use `/help` for more information
-
-**User ID:** `{message.from_user.id}`
-    """
+        conn.commit()
+        conn.close()
     
-    await message.reply_text(welcome_text, parse_mode="markdown")
+    def get_connection(self):
+        """Get database connection"""
+        return sqlite3.connect(self.db_path)
+    
+    def add_file(self, file_data: Dict) -> int:
+        """Add file to database"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            INSERT INTO files 
+            (file_id, file_name, file_type, file_size, mime_type, caption, uploader_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            file_data['file_id'],
+            file_data['file_name'],
+            file_data['file_type'],
+            file_data['file_size'],
+            file_data.get('mime_type'),
+            file_data.get('caption'),
+            file_data['uploader_id']
+        ))
+        
+        file_id = cursor.lastrowid
+        
+        # Update user stats
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_stats 
+            (user_id, total_uploads, total_storage_used, last_upload_date)
+            VALUES (?, 
+                    COALESCE((SELECT total_uploads FROM user_stats WHERE user_id = ?), 0) + 1,
+                    COALESCE((SELECT total_storage_used FROM user_stats WHERE user_id = ?), 0) + ?,
+                    ?)
+        ''', (
+            file_data['uploader_id'],
+            file_data['uploader_id'],
+            file_data['uploader_id'],
+            file_data['file_size'],
+            datetime.now()
+        ))
+        
+        conn.commit()
+        conn.close()
+        return file_id
+    
+    def create_file_link(self, file_id: int, hash_length: int = 8) -> str:
+        """Create unique link for file"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        unique_hash = secrets.token_urlsafe(hash_length)
+        expiry_date = datetime.now() + timedelta(days=config.LINK_EXPIRY_DAYS)
+        
+        cursor.execute('''
+            INSERT INTO file_links (file_id, unique_hash, expiry_date)
+            VALUES (?, ?, ?)
+        ''', (file_id, unique_hash, expiry_date))
+        
+        conn.commit()
+        conn.close()
+        return unique_hash
+    
+    def get_user_files(self, user_id: int, limit: int = 50) -> List[Dict]:
+        """Get files uploaded by user"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT f.id, f.file_name, f.file_type, f.file_size, f.upload_date, 
+                   f.access_count, fl.unique_hash
+            FROM files f
+            LEFT JOIN file_links fl ON f.id = fl.file_id AND fl.is_active = TRUE
+            WHERE f.uploader_id = ? AND f.is_active = TRUE
+            ORDER BY f.upload_date DESC
+            LIMIT ?
+        ''', (user_id, limit))
+        
+        files = []
+        for row in cursor.fetchall():
+            files.append({
+                'id': row[0],
+                'file_name': row[1],
+                'file_type': row[2],
+                'file_size': row[3],
+                'upload_date': row[4],
+                'access_count': row[5],
+                'unique_hash': row[6]
+            })
+        
+        conn.close()
+        return files
+    
+    def get_file_by_hash(self, unique_hash: str) -> Optional[Dict]:
+        """Get file details by unique hash"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT f.file_id, f.file_name, f.file_type, f.file_size, f.mime_type, 
+                   f.caption, f.access_count, fl.expiry_date
+            FROM files f
+            JOIN file_links fl ON f.id = fl.file_id
+            WHERE fl.unique_hash = ? AND fl.is_active = TRUE AND f.is_active = TRUE
+        ''', (unique_hash,))
+        
+        row = cursor.fetchone()
+        if row:
+            # Update access count
+            cursor.execute('''
+                UPDATE files 
+                SET access_count = access_count + 1, last_accessed = ?
+                WHERE file_id = ?
+            ''', (datetime.now(), row[0]))
+            
+            conn.commit()
+            conn.close()
+            
+            return {
+                'file_id': row[0],
+                'file_name': row[1],
+                'file_type': row[2],
+                'file_size': row[3],
+                'mime_type': row[4],
+                'caption': row[5],
+                'access_count': row[6] + 1,
+                'expiry_date': row[7]
+            }
+        
+        conn.close()
+        return None
 
-@app.on_message(filters.command("help"))
-async def help_handler(client, message: Message):
-    """Handle /help command"""
-    help_text = """
-📖 **How to use this bot:**
+class FileStoreBot:
+    """Main bot class"""
+    
+    def __init__(self):
+        self.db = DatabaseManager()
+        self.app = Application.builder().token(config.BOT_TOKEN).build()
+        self.setup_handlers()
+    
+    def setup_handlers(self):
+        """Setup bot handlers"""
+        # Command handlers
+        self.app.add_handler(CommandHandler("start", self.start))
+        self.app.add_handler(CommandHandler("help", self.help_command))
+        self.app.add_handler(CommandHandler("mystorage", self.my_storage))
+        self.app.add_handler(CommandHandler("stats", self.user_stats))
+        
+        # Message handlers
+        self.app.add_handler(MessageHandler(
+            filters.Document | filters.VIDEO | filters.AUDIO | filters.PHOTO, 
+            self.handle_file
+        ))
+        
+        # Callback query handler for buttons
+        self.app.add_handler(CallbackQueryHandler(self.button_handler))
+    
+    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send welcome message"""
+        welcome_text = """
+🤖 **Welcome to FileStore Bot!**
 
-1. **Upload Files:** Simply send any file to the bot
-2. **Download Links:** After upload, you'll get a download link
-3. **Progress Tracking:** See real-time upload/download progress
-4. **Large Files:** Supports files up to 4GB
+📁 **Features:**
+• Store files up to 4GB
+• Generate shareable links
+• No premium account required
+• Fast and secure
 
-**Supported Files:**
-• Documents (PDF, DOC, ZIP, etc.)
-• Videos (MP4, AVI, MKV, etc.)
-• Audio files (MP3, WAV, etc.)
-• Images (JPG, PNG, etc.)
+📤 **How to use:**
+1. Send any file (document, photo, video, audio)
+2. Bot will store it and generate a unique link
+3. Share the link with anyone
+
+🔧 **Commands:**
+/start - Show this message
+/mystorage - Show your stored files
+/stats - Your upload statistics
+/help - Get help
+
+⚠️ **Note:** Large files may take time to upload/download.
+        """
+        
+        await update.message.reply_text(welcome_text, parse_mode='Markdown')
+    
+    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Send help message"""
+        help_text = """
+📖 **Bot Help Guide**
+
+📤 **Uploading Files:**
+Simply send any file to the bot. Maximum file size: 4GB
+
+🔗 **Generating Links:**
+After uploading, the bot automatically generates a unique link.
+
+📊 **Managing Files:**
+Use /mystorage to view and manage your uploaded files.
+
+📈 **Statistics:**
+Use /stats to see your upload statistics.
+
+🛡️ **Privacy:**
+Only people with your generated links can access your files.
+
+❓ **Supported Files:**
+• Documents (PDF, ZIP, RAR, DOC, XLS, etc.)
+• Photos (JPEG, PNG, WEBP, etc.)
+• Videos (MP4, AVI, MKV, MOV, etc.)
+• Audio (MP3, WAV, OGG, etc.)
 • Any other file type
 
-**Note:** Files are stored temporarily and links expire after some time.
-    """
-    
-    await message.reply_text(help_text, parse_mode="markdown")
-
-@app.on_message(
-    filters.document | filters.video | filters.audio | filters.photo,
-    group=1
-)
-async def file_handler(client, message: Message):
-    """Handle incoming files with deduplication"""
-    
-    # Check if message is already being processed or completed
-    if is_message_processing(message.id):
-        logger.info(f"Message {message.id} is already being processed, skipping")
-        return
-    
-    if is_message_completed(message.id):
-        logger.info(f"Message {message.id} has already been processed, skipping")
-        return
-    
-    # Mark message as being processed
-    mark_message_processing(message.id, True)
-    
-    try:
-        user = message.from_user
-        logger.info(f"File received from user {user.id} (message {message.id})")
+📞 **Support:**
+Contact admin for any issues.
+        """
         
-        # Send initial progress message
-        progress_msg = await message.reply_text("📥 **Downloading file...**\n`0%` - Preparing download")
+        await update.message.reply_text(help_text, parse_mode='Markdown')
+    
+    def format_file_size(self, size_bytes):
+        """Format file size to human readable format"""
+        if size_bytes is None:
+            return "Unknown"
         
-        # Progress callback
-        async def update_progress(current, total, percentage, speed, operation):
-            speed_mb = speed / (1024 * 1024) if speed > 0 else 0
-            if total > 0:
-                current_mb = current / (1024 * 1024)
-                total_mb = total / (1024 * 1024)
-                progress_text = f"📥 **{operation}...**\n`{percentage:.1f}%` ({current_mb:.1f}/{total_mb:.1f} MB) - {speed_mb:.1f} MB/s"
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size_bytes < 1024.0:
+                return f"{size_bytes:.2f} {unit}"
+            size_bytes /= 1024.0
+        return f"{size_bytes:.2f} TB"
+    
+    async def handle_file(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle incoming files"""
+        user_id = update.effective_user.id
+        message = update.message
+        
+        try:
+            # Determine file type and get file object
+            if message.document:
+                file_obj = message.document
+                file_type = "document"
+            elif message.video:
+                file_obj = message.video
+                file_type = "video"
+            elif message.audio:
+                file_obj = message.audio
+                file_type = "audio"
+            elif message.photo:
+                file_obj = message.photo[-1]  # Highest resolution
+                file_type = "photo"
             else:
-                progress_text = f"📥 **{operation}...**\n`Preparing...`"
+                await message.reply_text("❌ Unsupported file type!")
+                return
             
-            try:
-                await progress_msg.edit_text(progress_text)
-            except Exception as e:
-                logger.debug(f"Progress update error: {e}")
-        
-        # Download the file
-        file_path = await FileHandler.download_file(
-            message,
-            progress_callback=update_progress
-        )
-        
-        # Update message for upload
-        await progress_msg.edit_text("📤 **Uploading to storage...**\n`0%` - Preparing upload")
-        
-        # Upload the file
-        uploaded_message = await FileHandler.upload_file(
-            file_path,
-            message.chat.id,
-            progress_callback=update_progress
-        )
-        
-        # Generate download link
-        if uploaded_message.document:
-            file_id = uploaded_message.document.file_id
-        elif uploaded_message.video:
-            file_id = uploaded_message.video.file_id
-        elif uploaded_message.audio:
-            file_id = uploaded_message.audio.file_id
-        else:
-            file_id = f"file_{uploaded_message.id}"
+            # Get file details
+            file_id = file_obj.file_id
+            file_name = getattr(file_obj, 'file_name', f'{file_type}_{file_id}')
+            file_size = file_obj.file_size
+            mime_type = getattr(file_obj, 'mime_type', 'unknown')
+            caption = message.caption
             
-        download_link = FileHandler.generate_download_link(file_id)
-        
-        # Get file info
-        file_name = os.path.basename(file_path)
-        file_size = os.path.getsize(file_path)
-        file_size_mb = file_size / (1024 * 1024)
-        
-        # Create inline keyboard with download button
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📥 Download File", url=download_link)],
-            [InlineKeyboardButton("🔄 Share", switch_inline_query="")]
-        ])
-        
-        # Create response message
-        success_text = f"""
-✅ **File Uploaded Successfully!**
+            # Check file size
+            if file_size and file_size > config.MAX_FILE_SIZE:
+                await message.reply_text("❌ File size exceeds 4GB limit!")
+                return
+            
+            # Check if file type is allowed
+            if any(ext in file_name.lower() for ext in config.BLOCKED_EXTENSIONS):
+                await message.reply_text("❌ This file type is not allowed for security reasons!")
+                return
+            
+            # Prepare file data
+            file_data = {
+                'file_id': file_id,
+                'file_name': file_name,
+                'file_type': file_type,
+                'file_size': file_size,
+                'mime_type': mime_type,
+                'caption': caption,
+                'uploader_id': user_id
+            }
+            
+            # Store file in database
+            file_db_id = self.db.add_file(file_data)
+            
+            # Generate unique link
+            unique_hash = self.db.create_file_link(file_db_id, config.HASH_LENGTH)
+            
+            # Create shareable link
+            bot_username = (await self.app.bot.get_me()).username
+            file_link = f"https://t.me/{bot_username}?start={unique_hash}"
+            
+            # Prepare response message
+            response_text = f"""
+✅ **File Successfully Stored!**
 
 📁 **File Name:** `{file_name}`
-📊 **File Size:** `{file_size_mb:.2f} MB`
-🔗 **Download Link:** `{download_link}`
+📊 **File Size:** {self.format_file_size(file_size)}
+📝 **Type:** {file_type.title()}
+🔗 **Shareable Link:** {file_link}
 
-⚠️ **Note:** This link will expire after 24 hours.
-        """
-        
-        # Clean up local file
-        try:
-            os.remove(file_path)
-            logger.info(f"Cleaned up local file: {file_path}")
+💡 **Tip:** Share this link with anyone to allow them to download the file.
+            """
+            
+            keyboard = [
+                [InlineKeyboardButton("📁 Open File", url=file_link)],
+                [InlineKeyboardButton("🗂️ My Storage", callback_data="mystorage")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await message.reply_text(
+                response_text, 
+                parse_mode='Markdown',
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+            
         except Exception as e:
-            logger.warning(f"Could not remove file {file_path}: {e}")
-        
-        await progress_msg.edit_text(
-            success_text, 
-            parse_mode="markdown",
-            reply_markup=keyboard
-        )
-        
-        # Mark message as completed
-        mark_message_completed(message.id)
-        
-        # Clean up old messages periodically
-        await cleanup_old_messages()
-        
-    except RPCError as e:
-        logger.error(f"Telegram RPC error: {e}")
-        # Remove processing flag on error
-        mark_message_processing(message.id, False)
-        await message.reply_text("❌ **Telegram error. Please try again.**")
-    except Exception as e:
-        logger.error(f"File handling error: {e}")
-        # Remove processing flag on error
-        mark_message_processing(message.id, False)
-        error_msg = await message.reply_text("❌ **Error processing file. Please try again.**")
-        # Delete error message after 10 seconds
-        await asyncio.sleep(10)
-        await error_msg.delete()
-
-@app.on_message(filters.command("status"))
-async def status_handler(client, message: Message):
-    """Show bot status"""
-    status_text = f"""
-🟢 **Bot Status: Online**
-
-**System Information:**
-• Pyrogram: ✅ Enabled
-• TgCrypto: ✅ Active
-• Async operations: ✅ Enabled
-• Progress tracking: ✅ Active
-• Large file support: ✅ Up to 4GB
-• File links: ✅ Working
-• Duplicate protection: ✅ Active
-
-**Storage:**
-• Active links: `{len(file_links)}`
-• Processing messages: `{len(processing_messages)}`
-• Completed messages: `{len(completed_messages)}`
-• Max file size: `4 GB`
-• Supported types: `All files`
-
-**Commands:**
-• Send any file to upload
-• `/help` - Show help
-• `/status` - Show this status
-• `/cleanup` - Cleanup storage
-• `/stats` - Show statistics
-    """
+            logger.error(f"Error handling file: {e}")
+            await message.reply_text("❌ An error occurred while processing your file. Please try again.")
     
-    await message.reply_text(status_text, parse_mode="markdown")
-
-@app.on_message(filters.command("cleanup"))
-async def cleanup_handler(client, message: Message):
-    """Clean up expired file links and message tracking"""
-    try:
-        # Clean up file links
-        max_links = 1000
-        if len(file_links) > max_links:
-            keys_to_remove = list(file_links.keys())[:len(file_links) - max_links]
-            expired_links_count = len(keys_to_remove)
-            for key in keys_to_remove:
-                del file_links[key]
-        else:
-            expired_links_count = 0
+    async def my_storage(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show user's stored files"""
+        user_id = update.effective_user.id
         
-        # Clean up message tracking
-        await cleanup_old_messages()
-        cleaned_messages = len(processing_messages) + len(completed_messages) - 1000
-        if cleaned_messages < 0:
-            cleaned_messages = 0
-        
-        cleanup_text = f"""
-🧹 **Cleanup Completed**
-
-• Expired links removed: `{expired_links_count}`
-• Message tracking cleaned: `{cleaned_messages}`
-• Active links remaining: `{len(file_links)}`
-• Active messages tracking: `{len(processing_messages) + len(completed_messages)}`
-• Storage optimized: ✅
-        """
-        
-        await message.reply_text(cleanup_text, parse_mode="markdown")
-        
-    except Exception as e:
-        logger.error(f"Cleanup error: {e}")
-        await message.reply_text(f"❌ **Cleanup error:** {str(e)}")
-
-@app.on_message(filters.command("info"))
-async def info_handler(client, message: Message):
-    """Show file info before processing"""
-    try:
-        if (message.document or message.video or message.audio or message.photo):
-            if message.document:
-                file_name = message.document.file_name or f"document_{message.id}.bin"
-                file_size = message.document.file_size
-                file_type = "Document"
-            elif message.video:
-                file_name = message.video.file_name or f"video_{message.id}.mp4"
-                file_size = message.video.file_size
-                file_type = "Video"
-            elif message.audio:
-                file_name = message.audio.file_name or f"audio_{message.id}.mp3"
-                file_size = message.audio.file_size
-                file_type = "Audio"
-            elif message.photo:
-                file_name = f"photo_{message.id}.jpg"
-                file_size = message.photo.file_size
-                file_type = "Photo"
+        try:
+            files = self.db.get_user_files(user_id)
             
-            file_size_mb = file_size / (1024 * 1024) if file_size else 0
+            if not files:
+                await update.message.reply_text("📭 You haven't uploaded any files yet.")
+                return
             
-            info_text = f"""
-📁 **File Information:**
+            response_text = "📁 **Your Stored Files:**\n\n"
+            
+            for i, file in enumerate(files[:10], 1):  # Show first 10 files
+                file_size = self.format_file_size(file['file_size'])
+                upload_date = file['upload_date'][:10] if file['upload_date'] else "Unknown"
+                
+                response_text += f"{i}. **{file['file_name']}**\n"
+                response_text += f"   📊 Size: {file_size} | 📅 {upload_date}\n"
+                response_text += f"   👁️ Views: {file['access_count']}\n"
+                
+                if file['unique_hash']:
+                    bot_username = (await self.app.bot.get_me()).username
+                    file_link = f"https://t.me/{bot_username}?start={file['unique_hash']}"
+                    response_text += f"   🔗 `{file_link}`\n"
+                
+                response_text += "\n"
+            
+            if len(files) > 10:
+                response_text += f"\n📋 Showing 10 out of {len(files)} files. Use buttons below to navigate."
+            
+            # Create navigation buttons
+            keyboard = [
+                [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_storage")],
+                [InlineKeyboardButton("📊 Statistics", callback_data="user_stats")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                response_text, 
+                parse_mode='Markdown',
+                reply_markup=reply_markup,
+                disable_web_page_preview=True
+            )
+            
+        except Exception as e:
+            logger.error(f"Error showing storage: {e}")
+            await update.message.reply_text("❌ An error occurred while retrieving your files.")
+    
+    async def user_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show user statistics"""
+        user_id = update.effective_user.id
+        
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute('''
+                SELECT total_uploads, total_storage_used, last_upload_date
+                FROM user_stats WHERE user_id = ?
+            ''', (user_id,))
+            
+            row = cursor.fetchone()
+            conn.close()
+            
+            if not row:
+                await update.message.reply_text("📊 You haven't uploaded any files yet.")
+                return
+            
+            total_uploads, total_storage, last_upload = row
+            
+            stats_text = f"""
+📊 **Your Statistics**
 
-**Name:** `{file_name}`
-**Size:** `{file_size_mb:.2f} MB`
-**Type:** `{file_type}`
+📤 **Total Uploads:** {total_uploads}
+💾 **Storage Used:** {self.format_file_size(total_storage)}
+📅 **Last Upload:** {last_upload[:10] if last_upload else 'Never'}
 
-Send the file to start upload process.
+⚡ **File Size Limit:** {self.format_file_size(config.MAX_FILE_SIZE)}
             """
-            await message.reply_text(info_text, parse_mode="markdown")
-        else:
-            await message.reply_text("❌ Please send a file to get information.")
-    except Exception as e:
-        logger.error(f"Info handler error: {e}")
-
-@app.on_message(filters.command("stats"))
-async def stats_handler(client, message: Message):
-    """Show bot statistics"""
-    try:
-        # Get some basic stats
-        downloads_dir = Path("downloads")
-        if downloads_dir.exists():
-            total_files = len(list(downloads_dir.glob("*")))
-            total_size = sum(f.stat().st_size for f in downloads_dir.glob("*") if f.is_file())
-            total_size_mb = total_size / (1024 * 1024)
-        else:
-            total_files = 0
-            total_size_mb = 0
+            
+            keyboard = [
+                [InlineKeyboardButton("📁 My Storage", callback_data="mystorage")],
+                [InlineKeyboardButton("🔄 Refresh", callback_data="refresh_stats")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            await update.message.reply_text(
+                stats_text, 
+                parse_mode='Markdown',
+                reply_markup=reply_markup
+            )
+            
+        except Exception as e:
+            logger.error(f"Error showing stats: {e}")
+            await update.message.reply_text("❌ An error occurred while retrieving statistics.")
+    
+    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle button callbacks"""
+        query = update.callback_query
+        await query.answer()
         
-        stats_text = f"""
-📊 **Bot Statistics**
-
-**File Storage:**
-• Active download links: `{len(file_links)}`
-• Local files: `{total_files}`
-• Local storage used: `{total_size_mb:.2f} MB`
-
-**Message Tracking:**
-• Processing messages: `{len(processing_messages)}`
-• Completed messages: `{len(completed_messages)}`
-
-**Performance:**
-• Pyrogram: ✅ Optimized
-• TgCrypto: ✅ Encrypted
-• Async: ✅ High-speed
-• Progress: ✅ Real-time
-• Duplicate protection: ✅ Active
-
-**Limits:**
-• Max file size: `4 GB`
-• Link TTL: `24 hours`
-            """
+        user_id = query.from_user.id
         
-        await message.reply_text(stats_text, parse_mode="markdown")
-        
-    except Exception as e:
-        logger.error(f"Stats error: {e}")
+        if query.data == "mystorage":
+            # Create a temporary message to simulate my_storage command
+            class MockMessage:
+                def __init__(self, user_id, chat_id):
+                    self.from_user = type('obj', (object,), {'id': user_id})()
+                    self.chat = type('obj', (object,), {'id': chat_id})()
+                    self.reply_text = query.edit_message_text
+            
+            mock_update = Update(update.update_id, message=MockMessage(user_id, query.message.chat_id))
+            await self.my_storage(mock_update, context)
+            
+        elif query.data == "user_stats":
+            class MockMessage:
+                def __init__(self, user_id, chat_id):
+                    self.from_user = type('obj', (object,), {'id': user_id})()
+                    self.chat = type('obj', (object,), {'id': chat_id})()
+                    self.reply_text = query.edit_message_text
+            
+            mock_update = Update(update.update_id, message=MockMessage(user_id, query.message.chat_id))
+            await self.user_stats(mock_update, context)
+            
+        elif query.data == "refresh_storage":
+            await query.edit_message_text("🔄 Refreshing...")
+            class MockMessage:
+                def __init__(self, user_id, chat_id):
+                    self.from_user = type('obj', (object,), {'id': user_id})()
+                    self.chat = type('obj', (object,), {'id': chat_id})()
+                    self.reply_text = query.edit_message_text
+            
+            mock_update = Update(update.update_id, message=MockMessage(user_id, query.message.chat_id))
+            await self.my_storage(mock_update, context)
+            
+        elif query.data == "refresh_stats":
+            await query.edit_message_text("🔄 Refreshing...")
+            class MockMessage:
+                def __init__(self, user_id, chat_id):
+                    self.from_user = type('obj', (object,), {'id': user_id})()
+                    self.chat = type('obj', (object,), {'id': chat_id})()
+                    self.reply_text = query.edit_message_text
+            
+            mock_update = Update(update.update_id, message=MockMessage(user_id, query.message.chat_id))
+            await self.user_stats(mock_update, context)
+    
+    def run(self):
+        """Start the bot"""
+        logger.info("Starting FileStore Bot...")
+        self.app.run_polling()
 
-# Web server for download links (basic implementation)
-async def handle_download(request):
-    """Handle download requests"""
-    token = request.match_info.get('token')
-    
-    if not token or token not in file_links:
-        return web.Response(text="Invalid or expired download link", status=404)
-    
-    file_id = file_links[token]
-    
-    # In production, implement proper file serving
-    return web.Response(
-        text=f"""
-        Download Link for File ID: {file_id}
-        
-        In production, this would serve the file directly.
-        Currently, you need to use the Telegram file reference.
-        
-        Bot: @{(await app.get_me()).username}
-        """,
-        headers={'Content-Disposition': f'attachment; filename="file_{file_id}"'}
-    )
-
-async def start_web_server():
-    """Start web server for download links"""
-    app_web = web.Application()
-    app_web.router.add_get('/download/{token}', handle_download)
-    
-    # Get web server config with defaults
-    host = getattr(config, 'WEB_HOST', 'localhost')
-    port = getattr(config, 'WEB_PORT', 8080)
-    
-    runner = web.AppRunner(app_web)
-    await runner.setup()
-    
-    site = web.TCPSite(runner, host, port)
-    await site.start()
-    logger.info(f"Web server started on http://{host}:{port}")
-
-async def main():
-    """Main function to start the bot"""
-    logger.info("Starting High-Speed File Bot with Pyrogram...")
-    
-    # Validate config
-    if not all([config.API_ID, config.API_HASH, config.BOT_TOKEN]):
-        logger.error("Missing required configuration!")
-        exit(1)
-    
-    # Start web server for download links
-    if getattr(config, 'ENABLE_WEB_SERVER', True):
-        await start_web_server()
-    
-    # Start the Pyrogram client
-    await app.start()
-    
-    # Get bot info
-    me = await app.get_me()
-    logger.info(f"Bot started successfully: @{me.username}")
-    
-    # Log bot capabilities
-    logger.info("Bot features:")
-    logger.info("- Pyrogram with TgCrypto encryption")
-    logger.info("- Async file operations")
-    logger.info("- Progress tracking")
-    logger.info("- 4GB file support")
-    logger.info("- Download link generation")
-    logger.info("- Duplicate message protection")
-    
-    # Keep running
-    await asyncio.Event().wait()
-    
-if __name__ == '__main__':
-    # Create necessary directories
-    os.makedirs('downloads', exist_ok=True)
-    os.makedirs('logs', exist_ok=True)
-    
-    # Run the bot
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
-    except Exception as e:
-        logger.error(f"Bot crashed: {e}")
-    finally:
-        # Stop the client properly
-        asyncio.run(app.stop())
+# Main execution
+if __name__ == "__main__":
+    bot 
