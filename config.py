@@ -1,38 +1,36 @@
 import os
-from typing import Optional
+from typing import Dict, Any
 
 class Config:
-    """Configuration class for the Telegram bot"""
+    """Configuration class for FileStore Bot"""
     
     def __init__(self):
-        # Required Telegram configuration
-        self.API_ID = int(os.getenv('API_ID', 0))
-        self.API_HASH = os.getenv('API_HASH', '')
-        self.BOT_TOKEN = os.getenv('BOT_TOKEN', '')
+        # Bot Configuration
+        self.BOT_TOKEN = os.getenv('BOT_TOKEN', 'your_bot_token_here')
+        self.ADMIN_ID = int(os.getenv('ADMIN_ID', '123456789'))
         
-        # Web server configuration (optional)
-        self.WEB_HOST = os.getenv('WEB_HOST', 'localhost')
-        self.WEB_PORT = int(os.getenv('WEB_PORT', 8080))
-        self.ENABLE_WEB_SERVER = os.getenv('ENABLE_WEB_SERVER', 'true').lower() == 'true'
+        # Database Configuration
+        self.DATABASE_URL = os.getenv('DATABASE_URL', 'sqlite:///file_store.db')
+        self.DB_PATH = 'file_store.db'
         
-        # Domain for download links (optional)
-        self.DOMAIN = os.getenv('DOMAIN', 'localhost:8080')
+        # Bot Settings
+        self.MAX_FILE_SIZE = 4 * 1024 * 1024 * 1024  # 4GB in bytes
+        self.LINK_EXPIRY_DAYS = 365  # Link expiry in days
+        self.HASH_LENGTH = 8  # Length of unique hash for links
         
-        # File handling configuration
-        self.MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', 4 * 1024 * 1024 * 1024))  # 4GB default
-        self.FILE_LINK_TTL = int(os.getenv('FILE_LINK_TTL', 24 * 60 * 60))  # 24 hours default
+        # Rate Limiting
+        self.MAX_UPLOADS_PER_HOUR = 50
+        self.MAX_STORAGE_PER_USER = 100 * 1024 * 1024 * 1024  # 100GB per user
         
-        # Logging configuration
-        self.LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO')
-        self.LOG_FILE = os.getenv('LOG_FILE', 'logs/bot.log')
+        # Web Server for direct downloads (optional)
+        self.WEB_SERVER_ENABLED = False
+        self.WEB_SERVER_PORT = 8080
         
-    def validate(self) -> bool:
-        """Validate required configuration"""
-        required_vars = ['API_ID', 'API_HASH', 'BOT_TOKEN']
-        for var in required_vars:
-            if not getattr(self, var):
-                return False
-        return True
+        # Security
+        self.ALLOWED_FILE_TYPES = [
+            'image/', 'video/', 'audio/', 'text/', 'application/'
+        ]
+        self.BLOCKED_EXTENSIONS = ['exe', 'bat', 'cmd', 'sh', 'php']
 
-# Global config instance
+# Create global config instance
 config = Config()
